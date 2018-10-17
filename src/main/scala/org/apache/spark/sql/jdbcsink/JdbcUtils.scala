@@ -973,6 +973,120 @@ object JdbcUtils extends Logging {
     }
   }
 
+  def saveInternalPartitionFastLoad(getConnection: () => Connection,
+                            table: String,
+                            iterator: Iterator[InternalRow],
+                            rddSchema: StructType,
+                            insertStmt: String,
+                            batchSize: Int,
+                            dialect: JdbcDialect,
+                            isolationLevel: Int): Iterator[Byte] = {
+    val conn = getConnection()
+    var committed = false
+
+    var finalIsolationLevel = Connection.TRANSACTION_NONE
+    if (isolationLevel != Connection.TRANSACTION_NONE) {
+      try {
+        val metadata = conn.getMetaData
+        if (metadata.supportsTransactions()) {
+          // Update to at least use the default isolation, if any transaction level
+          // has been chosen and transactions are supported
+          val defaultIsolation = metadata.getDefaultTransactionIsolation
+          finalIsolationLevel = defaultIsolation
+          if (metadata.supportsTransactionIsolationLevel(isolationLevel)) {
+            // Finally update to actually requested level if possible
+            finalIsolationLevel = isolationLevel
+          } else {
+            logWarning(
+              s"Requested isolation level $isolationLevel is not supported; " +
+                s"falling back to default isolation level $defaultIsolation")
+          }
+        } else {
+          logWarning(
+            s"Requested isolation level $isolationLevel, but transactions are unsupported")
+        }
+      } catch {
+        case NonFatal(e) =>
+          logWarning("Exception while detecting transaction support", e)
+      }
+    }
+    val supportsTransactions = finalIsolationLevel != Connection.TRANSACTION_NONE
+
+    try {
+      if (supportsTransactions) {
+        conn.setAutoCommit(false) // Everything in the same db transaction.
+        conn.setTransactionIsolation(finalIsolationLevel)
+      }
+      val stmt = conn.prepareStatement(insertStmt)
+      val setters =
+        rddSchema.fields.map(f => makeInternalSetter(conn, dialect, f.dataType))
+      val nullTypes =
+        rddSchema.fields.map(f => getJdbcType(f.dataType, dialect).jdbcNullType)
+      val numFields = rddSchema.fields.length
+
+      try {
+        var rowCount = 0
+        while (iterator.hasNext) {
+          val row = iterator.next()
+          var i = 0
+          while (i < numFields) {
+            if (row.isNullAt(i)) {
+              stmt.setNull(i + 1, nullTypes(i))
+            } else {
+              setters(i).apply(stmt, row, i)
+            }
+            i = i + 1
+          }
+          stmt.addBatch()
+          rowCount += 1
+          if (rowCount % batchSize == 0) {
+            stmt.executeBatch()
+            rowCount = 0
+          }
+        }
+        if (rowCount > 0) {
+          stmt.executeBatch()
+        }
+      } finally {
+        stmt.close()
+      }
+      if (supportsTransactions) {
+        conn.commit()
+      }
+      committed = true
+      Iterator.empty
+    } catch {
+      case e: SQLException =>
+        val cause = e.getNextException
+        if (cause != null && e.getCause != cause) {
+          if (e.getCause == null) {
+            e.initCause(cause)
+          } else {
+            e.addSuppressed(cause)
+          }
+        }
+        throw e
+    } finally {
+      if (!committed) {
+        // The stage must fail.  We got here through an exception path, so
+        // let the exception through unless rollback() or close() want to
+        // tell the user about another problem.
+        if (supportsTransactions) {
+          conn.rollback()
+        }
+        conn.close()
+      } else {
+        // The stage must succeed.  We cannot propagate any exception close() might throw.
+        try {
+          conn.close()
+        } catch {
+          case e: Exception =>
+            logWarning("Transaction succeeded, but closing failed", e)
+        }
+      }
+    }
+  }
+
   /**
     * Compute the schema string for this RDD.
     */

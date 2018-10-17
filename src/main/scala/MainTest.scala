@@ -22,7 +22,7 @@ object MainTest extends App {
     .writeStream
     .format("org.apache.spark.sql.jdbcsink")
     .option("checkpointLocation", "checkpointLocation")
-    .option("url", "jdbc:teradata://192.168.43.154/DATABASE=MM") //TYPE=FASTLOAD
+    .option("url", "jdbc:teradata://192.168.1.102/DATABASE=MM,TYPE=FASTLOAD") //TYPE=FASTLOAD
     .option("dbtable", "mm.Test1")
     .option("user", "DBC")
     .option("password", "dbc")

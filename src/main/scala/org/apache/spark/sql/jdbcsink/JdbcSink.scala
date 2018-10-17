@@ -19,6 +19,7 @@ package org.apache.spark.sql.jdbcsink
 
 import java.sql.Connection
 
+import org.apache.spark.SparkEnv
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.InternalRow
@@ -43,6 +44,10 @@ class JdbcSink(sqlContext: SQLContext,
   // is replayed, JDBC SInk will delete the rows that were added to the previous play of the
   // batch
   val batchIdCol = parameters.get("batchIdCol")
+
+  val useTemporaryExecutorTable = isFastLoad()
+  logInfo(s"Using temporary executor tables : $useTemporaryExecutorTable")
+
   def addBatch(batchId: Long, df: DataFrame): Unit = {
 
     val schema: StructType = batchIdCol
@@ -72,7 +77,7 @@ class JdbcSink(sqlContext: SQLContext,
               saveRows(df, isCaseSensitive, options, batchId)
             }
           } else if (outputMode == OutputMode.Append()) {
-            saveRows(df, isCaseSensitive, options, batchId)
+              saveRows(df, isCaseSensitive, options, batchId)
           } else {
             throw new IllegalArgumentException(s"$outputMode not supported")
           }
@@ -95,6 +100,20 @@ class JdbcSink(sqlContext: SQLContext,
                isCaseSensitive: Boolean,
                options: JDBCOptions,
                batchId: Long): Unit = {
+    if (useTemporaryExecutorTable) {
+      saveRowsUsingTemporaryExecutorTable(df, isCaseSensitive, options, batchId)
+    } else {
+      saveRowsToTargetTable(df, isCaseSensitive, options, batchId)
+    }
+  }
+
+  /**
+    * Saves the RDD to the database in a single transaction.
+    */
+  def saveRowsToTargetTable(df: DataFrame,
+                            isCaseSensitive: Boolean,
+                            options: JDBCOptions,
+                            batchId: Long): Unit = {
     val url = options.url
     val table = options.table
     val dialect = JdbcDialects.get(url)
@@ -148,6 +167,68 @@ class JdbcSink(sqlContext: SQLContext,
     }
   }
 
+
+  def saveRowsUsingTemporaryExecutorTable(df: DataFrame,
+               isCaseSensitive: Boolean,
+               options: JDBCOptions,
+               batchId: Long): Unit = {
+    val url = options.url
+    val table = options.table
+    val dialect = JdbcDialects.get(url)
+    val getConnection: () => Connection = createConnectionFactory(options)
+    val batchSize = options.batchSize
+    val isolationLevel = options.isolationLevel
+
+    val repartitionedDF = options.numPartitions match {
+      case Some(n) if n <= 0 =>
+        throw new IllegalArgumentException(
+          s"Invalid value `$n` for parameter `${JDBCOptions.JDBC_NUM_PARTITIONS}` in table writing " +
+            "via JDBC. The minimum value is 1.")
+      case Some(n) if n < df.rdd.getNumPartitions => df.coalesce(n)
+      case _                                      => df
+    }
+    if (batchIdCol.isEmpty) {
+
+      val rddSchema = df.schema
+      repartitionedDF.queryExecution.toRdd.foreachPartition(iterator => {
+        val executorTable = table + "$" + SparkEnv.get.executorId
+        logInfo(s"Executor table : $executorTable")
+        //TODO create table if doesn't exist
+        val insertStmt = getInsertStatement(executorTable, df.schema, None, isCaseSensitive, dialect)
+        JdbcUtils.saveInternalPartitionFastLoad(getConnection,
+          table,
+          iterator,
+          rddSchema,
+          insertStmt,
+          batchSize,
+          dialect,
+          isolationLevel)
+      })
+    } else {
+
+      // batchId col is defined.. construct a schema by adding the batchId col to the DF schema
+      // also put the value of the batch id to the end of every row in the DF
+      val dfSchema = df.schema
+      val rddSchema: StructType = df.schema.add(batchIdCol.get, LongType, false)
+      repartitionedDF.queryExecution.toRdd.foreachPartition(iterator => {
+        val executorTable = table + "$" + SparkEnv.get.executorId
+        logInfo(s"Executor table : $executorTable")
+        //TODO create table if not exists
+        val insertStmt = getInsertStatement(executorTable, rddSchema, None, isCaseSensitive, dialect)
+        JdbcUtils.saveInternalPartitionFastLoad(
+          getConnection,
+          table,
+          iterator
+            .map(ir => InternalRow.fromSeq(ir.toSeq(dfSchema) :+ batchId)),
+          rddSchema,
+          insertStmt,
+          batchSize,
+          dialect,
+          isolationLevel)
+      })
+    }
+  }
+
   def saveMode(outputMode: OutputMode): SaveMode = {
     if (outputMode == OutputMode.Append()) {
       SaveMode.Append
@@ -158,4 +239,9 @@ class JdbcSink(sqlContext: SQLContext,
         s"Output mode $outputMode is not supported by JdbcSink")
     }
   }
+
+  def isFastLoad() : Boolean = {
+    options.url.contains("TYPE=FASTLOAD")
+  }
+
 }
