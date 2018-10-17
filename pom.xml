@@ -41,6 +41,24 @@
             <artifactId>commons-io</artifactId>
             <version>2.6</version>
         </dependency>
+
+
+
+        <dependency>
+            <groupId>teradata</groupId>
+            <artifactId>jdbc</artifactId>
+            <version>16.20</version>
+            <scope>system</scope>
+            <systemPath>${basedir}/lib/terajdbc4.jar</systemPath>
+        </dependency>
+
+        <dependency>
+            <groupId>teradata</groupId>
+            <artifactId>jdbc_config</artifactId>
+            <version>16.20</version>
+            <scope>system</scope>
+            <systemPath>${basedir}/lib/tdgssconfig.jar</systemPath>
+        </dependency>
     </dependencies>
 
     <build>

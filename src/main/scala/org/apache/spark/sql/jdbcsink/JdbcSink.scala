@@ -29,11 +29,12 @@ import org.apache.spark.sql.jdbc.JdbcDialects
 import org.apache.spark.sql.streaming.OutputMode
 import org.apache.spark.sql.types._
 
-
 class JdbcSink(sqlContext: SQLContext,
                parameters: Map[String, String],
                partitionColumns: Seq[String],
-               outputMode: OutputMode) extends Sink  with Logging {
+               outputMode: OutputMode)
+    extends Sink
+    with Logging {
   val options = new JDBCOptions(parameters)
 
   val sinkLog = new JDBCSinkLog(parameters, sqlContext.sparkSession)
@@ -44,8 +45,9 @@ class JdbcSink(sqlContext: SQLContext,
   val batchIdCol = parameters.get("batchIdCol")
   def addBatch(batchId: Long, df: DataFrame): Unit = {
 
-    val schema: StructType = batchIdCol.map(colName => df.schema.add(colName, LongType, false))
-                                        .getOrElse(df.schema)
+    val schema: StructType = batchIdCol
+      .map(colName => df.schema.add(colName, LongType, false))
+      .getOrElse(df.schema)
     val conn = JdbcUtils.createConnectionFactory(options)()
     try {
       if (sinkLog.isBatchCommitted(batchId, conn)) {
@@ -58,7 +60,8 @@ class JdbcSink(sqlContext: SQLContext,
         if (tableExists) {
           if (outputMode == OutputMode.Complete()) {
 
-            if (options.isTruncate && isCascadingTruncateTable(options.url).contains(false)) {
+            if (options.isTruncate && isCascadingTruncateTable(options.url)
+                  .contains(false)) {
               // In this case, we should truncate table and then load.
               truncateTable(conn, options)
               saveRows(df, isCaseSensitive, options, batchId)
@@ -66,7 +69,7 @@ class JdbcSink(sqlContext: SQLContext,
               // Otherwise, do not truncate the table, instead drop and recreate it
               dropTable(conn, options.table)
               createTable(conn, df, options)
-              saveRows(df, isCaseSensitive, options,batchId)
+              saveRows(df, isCaseSensitive, options, batchId)
             }
           } else if (outputMode == OutputMode.Append()) {
             saveRows(df, isCaseSensitive, options, batchId)
@@ -86,13 +89,12 @@ class JdbcSink(sqlContext: SQLContext,
   }
 
   /**
-   * Saves the RDD to the database in a single transaction.
-   */
-  def saveRows(
-                 df: DataFrame,
-                 isCaseSensitive: Boolean,
-                 options: JDBCOptions,
-                 batchId: Long): Unit = {
+    * Saves the RDD to the database in a single transaction.
+    */
+  def saveRows(df: DataFrame,
+               isCaseSensitive: Boolean,
+               options: JDBCOptions,
+               batchId: Long): Unit = {
     val url = options.url
     val table = options.table
     val dialect = JdbcDialects.get(url)
@@ -101,19 +103,27 @@ class JdbcSink(sqlContext: SQLContext,
     val isolationLevel = options.isolationLevel
 
     val repartitionedDF = options.numPartitions match {
-      case Some(n) if n <= 0 => throw new IllegalArgumentException(
-        s"Invalid value `$n` for parameter `${JDBCOptions.JDBC_NUM_PARTITIONS}` in table writing " +
-          "via JDBC. The minimum value is 1.")
+      case Some(n) if n <= 0 =>
+        throw new IllegalArgumentException(
+          s"Invalid value `$n` for parameter `${JDBCOptions.JDBC_NUM_PARTITIONS}` in table writing " +
+            "via JDBC. The minimum value is 1.")
       case Some(n) if n < df.rdd.getNumPartitions => df.coalesce(n)
-      case _ => df
+      case _                                      => df
     }
-    if(batchIdCol.isEmpty) {
+    if (batchIdCol.isEmpty) {
 
-      val insertStmt = getInsertStatement(table, df.schema, None, isCaseSensitive, dialect)
+      val insertStmt =
+        getInsertStatement(table, df.schema, None, isCaseSensitive, dialect)
       val rddSchema = df.schema
       repartitionedDF.queryExecution.toRdd.foreachPartition(iterator => {
-        JdbcUtils.saveInternalPartition(
-          getConnection, table, iterator, rddSchema, insertStmt, batchSize, dialect, isolationLevel)
+        JdbcUtils.saveInternalPartition(getConnection,
+                                        table,
+                                        iterator,
+                                        rddSchema,
+                                        insertStmt,
+                                        batchSize,
+                                        dialect,
+                                        isolationLevel)
       })
     } else {
 
@@ -121,24 +131,31 @@ class JdbcSink(sqlContext: SQLContext,
       // also put the value of the batch id to the end of every row in the DF
       val dfSchema = df.schema
       val rddSchema: StructType = df.schema.add(batchIdCol.get, LongType, false)
-      val insertStmt = getInsertStatement(table, rddSchema, None, isCaseSensitive, dialect)
+      val insertStmt =
+        getInsertStatement(table, rddSchema, None, isCaseSensitive, dialect)
       repartitionedDF.queryExecution.toRdd.foreachPartition(iterator => {
         JdbcUtils.saveInternalPartition(
-          getConnection, table
-          , iterator.map(ir => InternalRow.fromSeq(ir.toSeq(dfSchema) :+ batchId ))
-          , rddSchema, insertStmt, batchSize, dialect, isolationLevel)
+          getConnection,
+          table,
+          iterator
+            .map(ir => InternalRow.fromSeq(ir.toSeq(dfSchema) :+ batchId)),
+          rddSchema,
+          insertStmt,
+          batchSize,
+          dialect,
+          isolationLevel)
       })
     }
   }
 
-
   def saveMode(outputMode: OutputMode): SaveMode = {
-    if (outputMode==OutputMode.Append()) {
+    if (outputMode == OutputMode.Append()) {
       SaveMode.Append
-    } else if (outputMode==OutputMode.Complete()) {
+    } else if (outputMode == OutputMode.Complete()) {
       SaveMode.Overwrite
     } else {
-      throw new IllegalArgumentException(s"Output mode $outputMode is not supported by JdbcSink")
+      throw new IllegalArgumentException(
+        s"Output mode $outputMode is not supported by JdbcSink")
     }
   }
 }

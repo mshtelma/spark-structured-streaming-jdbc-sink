@@ -22,15 +22,14 @@ import org.apache.spark.sql.execution.streaming.Sink
 import org.apache.spark.sql.sources._
 import org.apache.spark.sql.streaming.OutputMode
 
-
-class DefaultSource  extends DataSourceRegister with StreamSinkProvider{
+class DefaultSource extends DataSourceRegister with StreamSinkProvider {
 
   override def shortName(): String = "jdbcsink"
 
   def createSink(sqlContext: SQLContext,
-                  parameters: Map[String, String],
-                  partitionColumns: Seq[String],
-                  outputMode: OutputMode): Sink = {
+                 parameters: Map[String, String],
+                 partitionColumns: Seq[String],
+                 outputMode: OutputMode): Sink = {
     new JdbcSink(sqlContext, parameters, partitionColumns, outputMode)
 
   }
