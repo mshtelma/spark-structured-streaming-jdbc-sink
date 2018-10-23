@@ -23,7 +23,7 @@ import org.apache.spark.SparkEnv
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.execution.datasources.jdbc.JdbcUtils._
+import org.apache.spark.sql.jdbcsink.JdbcUtils._
 import org.apache.spark.sql.execution.datasources.jdbc._
 import org.apache.spark.sql.execution.streaming.Sink
 import org.apache.spark.sql.jdbc.JdbcDialects
@@ -54,11 +54,12 @@ class JdbcSink(sqlContext: SQLContext,
       .map(colName => df.schema.add(colName, LongType, false))
       .getOrElse(df.schema)
     val conn = JdbcUtils.createConnectionFactory(options)()
+    val sinkLogConn = sinkLog.createSinkLogConnectionFactory(parameters)()
     try {
-      if (sinkLog.isBatchCommitted(batchId, conn)) {
+      if (sinkLog.isBatchCommitted(batchId, sinkLogConn)) {
         logInfo(s"Skipping already committed batch $batchId")
       } else {
-        sinkLog.startBatch(batchId, conn)
+        sinkLog.startBatch(batchId, sinkLogConn)
         val isCaseSensitive = sqlContext.conf.caseSensitiveAnalysis
 
         val tableExists = JdbcUtils.tableExists(conn, options)
@@ -69,23 +70,23 @@ class JdbcSink(sqlContext: SQLContext,
                   .contains(false)) {
               // In this case, we should truncate table and then load.
               truncateTable(conn, options)
-              saveRows(df, isCaseSensitive, options, batchId)
+              saveRows(df, isCaseSensitive, parameters, batchId)
             } else {
               // Otherwise, do not truncate the table, instead drop and recreate it
               dropTable(conn, options.table)
-              createTable(conn, df, options)
-              saveRows(df, isCaseSensitive, options, batchId)
+              createTable(conn, df.schema, df.sparkSession, options)
+              saveRows(df, isCaseSensitive, parameters, batchId)
             }
           } else if (outputMode == OutputMode.Append()) {
-              saveRows(df, isCaseSensitive, options, batchId)
+              saveRows(df, isCaseSensitive, parameters, batchId)
           } else {
             throw new IllegalArgumentException(s"$outputMode not supported")
           }
         } else {
-          createTable(conn, df, options)
-          saveRows(df, isCaseSensitive, options, batchId)
+          createTable(conn, df.schema, df.sparkSession, options)
+          saveRows(df, isCaseSensitive, parameters, batchId)
         }
-        sinkLog.commitBatch(batchId, conn)
+        sinkLog.commitBatch(batchId, sinkLogConn)
 
       }
     } finally {
@@ -98,10 +99,10 @@ class JdbcSink(sqlContext: SQLContext,
     */
   def saveRows(df: DataFrame,
                isCaseSensitive: Boolean,
-               options: JDBCOptions,
+               parameters: Map[String, String],
                batchId: Long): Unit = {
     if (useTemporaryExecutorTable) {
-      saveRowsUsingTemporaryExecutorTable(df, isCaseSensitive, options, batchId)
+      saveRowsUsingTemporaryExecutorTable(df, isCaseSensitive, parameters, batchId)
     } else {
       saveRowsToTargetTable(df, isCaseSensitive, options, batchId)
     }
@@ -167,14 +168,12 @@ class JdbcSink(sqlContext: SQLContext,
     }
   }
 
-
   def saveRowsUsingTemporaryExecutorTable(df: DataFrame,
-               isCaseSensitive: Boolean,
-               options: JDBCOptions,
-               batchId: Long): Unit = {
-    val url = options.url
-    val table = options.table
-    val dialect = JdbcDialects.get(url)
+                                          isCaseSensitive: Boolean,
+                                          parameters: Map[String, String],
+                                          batchId: Long): Unit = {
+    val targetTable = options.table
+    val dialect = JdbcDialects.get(options.url)
     val getConnection: () => Connection = createConnectionFactory(options)
     val batchSize = options.batchSize
     val isolationLevel = options.isolationLevel
@@ -190,19 +189,43 @@ class JdbcSink(sqlContext: SQLContext,
     if (batchIdCol.isEmpty) {
 
       val rddSchema = df.schema
+      val sparkSession = df.sparkSession
       repartitionedDF.queryExecution.toRdd.foreachPartition(iterator => {
-        val executorTable = table + "$" + SparkEnv.get.executorId
-        logInfo(s"Executor table : $executorTable")
-        //TODO create table if doesn't exist
-        val insertStmt = getInsertStatement(executorTable, df.schema, None, isCaseSensitive, dialect)
-        JdbcUtils.saveInternalPartitionFastLoad(getConnection,
-          table,
+
+        //TODO fix - only works for single core executors
+        val executorTable = targetTable + "$" + SparkEnv.get.executorId
+
+        val executorParameters = parameters + ("dbtable" -> executorTable)
+        val executorOptions = new JDBCOptions(executorParameters)
+
+        val conn = createConnectionFactory(executorOptions).apply()
+        val tableExists = JdbcUtils.tableExists(conn, executorOptions)
+        if (!tableExists) {
+          createTable(conn, rddSchema, sparkSession, executorOptions)
+        } else {
+           if (!isTableEmpty(conn, executorOptions)) {
+             throw new IllegalStateException(s"Executor table $executorTable is not empty")
+           }
+        }
+        //Write to executor table
+        val insertStmt = getInsertStatement(executorTable, rddSchema, None, isCaseSensitive, dialect)
+        JdbcUtils.saveInternalPartition(getConnection,
+          executorTable,
           iterator,
           rddSchema,
           insertStmt,
           batchSize,
           dialect,
           isolationLevel)
+
+        //Copy all data from executor table to target table
+        val copyStmt = getCopyStatement(executorTable, targetTable, rddSchema, None, dialect)
+        JdbcUtils.executeSimpleStatement(getConnection,
+          copyStmt,
+          isolationLevel)
+
+        //Truncate the executor table
+        truncateTable(conn, executorOptions)
       })
     } else {
 
@@ -210,24 +233,49 @@ class JdbcSink(sqlContext: SQLContext,
       // also put the value of the batch id to the end of every row in the DF
       val dfSchema = df.schema
       val rddSchema: StructType = df.schema.add(batchIdCol.get, LongType, false)
+      val sparkSession = df.sparkSession
       repartitionedDF.queryExecution.toRdd.foreachPartition(iterator => {
-        val executorTable = table + "$" + SparkEnv.get.executorId
-        logInfo(s"Executor table : $executorTable")
-        //TODO create table if not exists
+
+        //TODO fix - only works for single core executors
+        val executorTable = targetTable + "$" + SparkEnv.get.executorId
+        //        val r = scala.util.Random
+        //        val executorTable = targetTable + "$" + r.nextInt(1000) + System.currentTimeMillis()
+
+        val executorParameters = parameters + ("dbtable" -> executorTable)
+        val executorOptions = new JDBCOptions(executorParameters)
+
+        val conn = createConnectionFactory(executorOptions).apply()
+        val tableExists = JdbcUtils.tableExists(conn, executorOptions)
+        if (!tableExists) {
+          createTable(conn, rddSchema, sparkSession, executorOptions)
+        } else {
+          if (!isTableEmpty(conn, executorOptions)) {
+            throw new IllegalStateException(s"Executor table $executorTable is not empty")
+          }
+        }
+        //Write to executor table
         val insertStmt = getInsertStatement(executorTable, rddSchema, None, isCaseSensitive, dialect)
-        JdbcUtils.saveInternalPartitionFastLoad(
-          getConnection,
-          table,
-          iterator
-            .map(ir => InternalRow.fromSeq(ir.toSeq(dfSchema) :+ batchId)),
+        JdbcUtils.saveInternalPartition(getConnection,
+          executorTable,
+          iterator.map(ir => InternalRow.fromSeq(ir.toSeq(dfSchema) :+ batchId)),
           rddSchema,
           insertStmt,
           batchSize,
           dialect,
           isolationLevel)
+
+        //Copy all data from executor table to target table
+        val copyStmt = getCopyStatement(executorTable, targetTable, rddSchema, None, dialect)
+        JdbcUtils.executeSimpleStatement(getConnection,
+          copyStmt,
+          isolationLevel)
+
+        //Truncate the executor table
+        truncateTable(conn, executorOptions)
       })
     }
   }
+
 
   def saveMode(outputMode: OutputMode): SaveMode = {
     if (outputMode == OutputMode.Append()) {

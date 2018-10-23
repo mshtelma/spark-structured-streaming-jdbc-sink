@@ -17,16 +17,7 @@
 
 package org.apache.spark.sql.jdbcsink
 
-import java.sql.{
-  Connection,
-  Driver,
-  DriverManager,
-  JDBCType,
-  PreparedStatement,
-  ResultSet,
-  ResultSetMetaData,
-  SQLException
-}
+import java.sql.{Connection, Driver, DriverManager, JDBCType, PreparedStatement, ResultSet, ResultSetMetaData, SQLException}
 import java.util.Locale
 
 import org.apache.spark.TaskContext
@@ -37,16 +28,8 @@ import org.apache.spark.sql.catalyst.analysis.Resolver
 import org.apache.spark.sql.catalyst.encoders.RowEncoder
 import org.apache.spark.sql.catalyst.expressions.SpecificInternalRow
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
-import org.apache.spark.sql.catalyst.util.{
-  CaseInsensitiveMap,
-  DateTimeUtils,
-  GenericArrayData
-}
-import org.apache.spark.sql.execution.datasources.jdbc.{
-  DriverRegistry,
-  DriverWrapper,
-  JDBCOptions
-}
+import org.apache.spark.sql.catalyst.util.{CaseInsensitiveMap, DateTimeUtils, GenericArrayData}
+import org.apache.spark.sql.execution.datasources.jdbc.{DriverRegistry, DriverWrapper, JDBCOptions}
 import org.apache.spark.sql.jdbc.{JdbcDialect, JdbcDialects, JdbcType}
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.util.SchemaUtils
@@ -56,7 +39,6 @@ import org.apache.spark.util.NextIterator
 
 import scala.util.Try
 import scala.util.control.NonFatal
-
 import scala.collection.JavaConverters._
 
 /**
@@ -125,10 +107,9 @@ object JdbcUtils extends Logging {
     * Truncates a table from the JDBC database without side effects.
     */
   def truncateTable(conn: Connection, options: JDBCOptions): Unit = {
-    val dialect = JdbcDialects.get(options.url)
     val statement = conn.createStatement
     try {
-      statement.executeUpdate(dialect.getTruncateQuery(options.table))
+      statement.executeUpdate(getTruncateStatement(options.table))
     } finally {
       statement.close()
     }
@@ -136,6 +117,27 @@ object JdbcUtils extends Logging {
 
   def isCascadingTruncateTable(url: String): Option[Boolean] = {
     JdbcDialects.get(url).isCascadingTruncateTable()
+  }
+
+  /**
+    * Returns true if the table is empty
+    */
+  def isTableEmpty(conn: Connection, options: JDBCOptions): Boolean = {
+    var isEmpty = false
+    Try {
+      val statement = conn.createStatement()
+      try {
+        val result = statement.executeQuery(s"SELECT count(*) FROM ${options.table}")
+        if (result.next()) {
+          isEmpty = result.getInt(1) == 0
+        }
+      }
+      finally
+      {
+        statement.close()
+      }
+    }
+    isEmpty
   }
 
   /**
@@ -173,6 +175,27 @@ object JdbcUtils extends Logging {
     }
     val placeholders = rddSchema.fields.map(_ => "?").mkString(",")
     s"INSERT INTO $table ($columns) VALUES ($placeholders)"
+  }
+
+  /**
+    * Returns an Insert SQL statement for copying all rows from the source table into the target table via JDBC conn.
+    */
+  def getCopyStatement(sourceTable: String,
+                       targetTable: String,
+                       rddSchema: StructType,
+                       tableSchema: Option[StructType],
+                       dialect: JdbcDialect): String = {
+    val columns = if (tableSchema.isEmpty) {
+      rddSchema.fields.map(x => dialect.quoteIdentifier(x.name)).mkString(",")
+    }
+    s"INSERT INTO $targetTable SELECT $columns FROM $sourceTable"
+  }
+
+  /**
+    * Returns an truncate SQL statement for truncating a table via JDBC conn.
+    */
+  def getTruncateStatement(table: String): String = {
+    s"DELETE $table ALL"
   }
 
   /**
@@ -973,14 +996,9 @@ object JdbcUtils extends Logging {
     }
   }
 
-  def saveInternalPartitionFastLoad(getConnection: () => Connection,
-                            table: String,
-                            iterator: Iterator[InternalRow],
-                            rddSchema: StructType,
-                            insertStmt: String,
-                            batchSize: Int,
-                            dialect: JdbcDialect,
-                            isolationLevel: Int): Iterator[Byte] = {
+  def executeSimpleStatement(getConnection: () => Connection,
+                             statement: String,
+                             isolationLevel: Int): Iterator[Byte] = {
     val conn = getConnection()
     var committed = false
 
@@ -1017,38 +1035,12 @@ object JdbcUtils extends Logging {
         conn.setAutoCommit(false) // Everything in the same db transaction.
         conn.setTransactionIsolation(finalIsolationLevel)
       }
-      val stmt = conn.prepareStatement(insertStmt)
-      val setters =
-        rddSchema.fields.map(f => makeInternalSetter(conn, dialect, f.dataType))
-      val nullTypes =
-        rddSchema.fields.map(f => getJdbcType(f.dataType, dialect).jdbcNullType)
-      val numFields = rddSchema.fields.length
+      val preparedStmt = conn.prepareStatement(statement)
 
       try {
-        var rowCount = 0
-        while (iterator.hasNext) {
-          val row = iterator.next()
-          var i = 0
-          while (i < numFields) {
-            if (row.isNullAt(i)) {
-              stmt.setNull(i + 1, nullTypes(i))
-            } else {
-              setters(i).apply(stmt, row, i)
-            }
-            i = i + 1
-          }
-          stmt.addBatch()
-          rowCount += 1
-          if (rowCount % batchSize == 0) {
-            stmt.executeBatch()
-            rowCount = 0
-          }
-        }
-        if (rowCount > 0) {
-          stmt.executeBatch()
-        }
+        preparedStmt.execute()
       } finally {
-        stmt.close()
+        preparedStmt.close()
       }
       if (supportsTransactions) {
         conn.commit()
@@ -1217,15 +1209,6 @@ object JdbcUtils extends Logging {
                       batchSize,
                       dialect,
                       isolationLevel))
-  }
-
-  /**
-    * Creates a table with a given schema.
-    */
-  def createTable(conn: Connection,
-                  df: DataFrame,
-                  options: JDBCOptions): Unit = {
-    createTable(conn, df.schema, df.sparkSession, options)
   }
 
   /**
