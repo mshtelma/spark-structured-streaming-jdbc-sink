@@ -238,8 +238,6 @@ class JdbcSink(sqlContext: SQLContext,
 
         //TODO fix - only works for single core executors
         val executorTable = targetTable + "$" + SparkEnv.get.executorId
-        //        val r = scala.util.Random
-        //        val executorTable = targetTable + "$" + r.nextInt(1000) + System.currentTimeMillis()
 
         val executorParameters = parameters + ("dbtable" -> executorTable)
         val executorOptions = new JDBCOptions(executorParameters)
