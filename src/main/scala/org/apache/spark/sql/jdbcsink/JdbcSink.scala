@@ -19,7 +19,7 @@ package org.apache.spark.sql.jdbcsink
 
 import java.sql.Connection
 
-import org.apache.spark.SparkEnv
+import org.apache.spark.{SparkEnv, TaskContext}
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.InternalRow
@@ -190,10 +190,10 @@ class JdbcSink(sqlContext: SQLContext,
 
       val rddSchema = df.schema
       val sparkSession = df.sparkSession
+
       repartitionedDF.queryExecution.toRdd.foreachPartition(iterator => {
 
-        //TODO fix - only works for single core executors
-        val executorTable = targetTable + "$" + SparkEnv.get.executorId
+        val executorTable = targetTable + "$" + SparkEnv.get.executorId + "_" + TaskContext.getPartitionId()
 
         val executorParameters = parameters + ("dbtable" -> executorTable)
         val executorOptions = new JDBCOptions(executorParameters)
@@ -236,8 +236,7 @@ class JdbcSink(sqlContext: SQLContext,
       val sparkSession = df.sparkSession
       repartitionedDF.queryExecution.toRdd.foreachPartition(iterator => {
 
-        //TODO fix - only works for single core executors
-        val executorTable = targetTable + "$" + SparkEnv.get.executorId
+        val executorTable = targetTable + "$" + SparkEnv.get.executorId + "_" + TaskContext.getPartitionId()
 
         val executorParameters = parameters + ("dbtable" -> executorTable)
         val executorOptions = new JDBCOptions(executorParameters)

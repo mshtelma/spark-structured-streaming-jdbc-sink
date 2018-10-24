@@ -5,7 +5,7 @@ object MainTest extends App {
   val spark = SparkSession.builder
     .appName("Spark Structured Streaming JDBC Sink Test App")
     .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
-    .master("local[1]")
+    .master("local[8]")
     .getOrCreate()
 
   import spark.implicits._
