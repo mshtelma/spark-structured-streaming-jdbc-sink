@@ -17,16 +17,7 @@
 
 package org.apache.spark.sql.jdbcsink
 
-import java.sql.{
-  Connection,
-  Driver,
-  DriverManager,
-  JDBCType,
-  PreparedStatement,
-  ResultSet,
-  ResultSetMetaData,
-  SQLException
-}
+import java.sql.{Connection, Driver, DriverManager, JDBCType, PreparedStatement, ResultSet, ResultSetMetaData, SQLException}
 import java.util.Locale
 
 import org.apache.spark.TaskContext
@@ -37,16 +28,8 @@ import org.apache.spark.sql.catalyst.analysis.Resolver
 import org.apache.spark.sql.catalyst.encoders.RowEncoder
 import org.apache.spark.sql.catalyst.expressions.SpecificInternalRow
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
-import org.apache.spark.sql.catalyst.util.{
-  CaseInsensitiveMap,
-  DateTimeUtils,
-  GenericArrayData
-}
-import org.apache.spark.sql.execution.datasources.jdbc.{
-  DriverRegistry,
-  DriverWrapper,
-  JDBCOptions
-}
+import org.apache.spark.sql.catalyst.util.{CaseInsensitiveMap, DateTimeUtils, GenericArrayData}
+import org.apache.spark.sql.execution.datasources.jdbc.{DriverRegistry, DriverWrapper, JDBCOptions}
 import org.apache.spark.sql.jdbc.{JdbcDialect, JdbcDialects, JdbcType}
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.util.SchemaUtils
@@ -56,7 +39,6 @@ import org.apache.spark.util.NextIterator
 
 import scala.util.Try
 import scala.util.control.NonFatal
-
 import scala.collection.JavaConverters._
 
 /**
@@ -125,10 +107,9 @@ object JdbcUtils extends Logging {
     * Truncates a table from the JDBC database without side effects.
     */
   def truncateTable(conn: Connection, options: JDBCOptions): Unit = {
-    val dialect = JdbcDialects.get(options.url)
     val statement = conn.createStatement
     try {
-      statement.executeUpdate(dialect.getTruncateQuery(options.table))
+      statement.executeUpdate(getTruncateStatement(options.table))
     } finally {
       statement.close()
     }
@@ -136,6 +117,27 @@ object JdbcUtils extends Logging {
 
   def isCascadingTruncateTable(url: String): Option[Boolean] = {
     JdbcDialects.get(url).isCascadingTruncateTable()
+  }
+
+  /**
+    * Returns true if the table is empty
+    */
+  def isTableEmpty(conn: Connection, options: JDBCOptions): Boolean = {
+    var isEmpty = false
+    Try {
+      val statement = conn.createStatement()
+      try {
+        val result = statement.executeQuery(s"SELECT count(*) FROM ${options.table}")
+        if (result.next()) {
+          isEmpty = result.getInt(1) == 0
+        }
+      }
+      finally
+      {
+        statement.close()
+      }
+    }
+    isEmpty
   }
 
   /**
@@ -173,6 +175,27 @@ object JdbcUtils extends Logging {
     }
     val placeholders = rddSchema.fields.map(_ => "?").mkString(",")
     s"INSERT INTO $table ($columns) VALUES ($placeholders)"
+  }
+
+  /**
+    * Returns an Insert SQL statement for copying all rows from the source table into the target table via JDBC conn.
+    */
+  def getCopyStatement(sourceTable: String,
+                       targetTable: String,
+                       rddSchema: StructType,
+                       tableSchema: Option[StructType],
+                       dialect: JdbcDialect): String = {
+    val columns = if (tableSchema.isEmpty) {
+      rddSchema.fields.map(x => dialect.quoteIdentifier(x.name)).mkString(",")
+    }
+    s"INSERT INTO $targetTable SELECT $columns FROM $sourceTable"
+  }
+
+  /**
+    * Returns an truncate SQL statement for truncating a table via JDBC conn.
+    */
+  def getTruncateStatement(table: String): String = {
+    s"DELETE $table ALL"
   }
 
   /**
@@ -973,6 +996,89 @@ object JdbcUtils extends Logging {
     }
   }
 
+  def executeSimpleStatement(getConnection: () => Connection,
+                             statement: String,
+                             isolationLevel: Int): Iterator[Byte] = {
+    val conn = getConnection()
+    var committed = false
+
+    var finalIsolationLevel = Connection.TRANSACTION_NONE
+    if (isolationLevel != Connection.TRANSACTION_NONE) {
+      try {
+        val metadata = conn.getMetaData
+        if (metadata.supportsTransactions()) {
+          // Update to at least use the default isolation, if any transaction level
+          // has been chosen and transactions are supported
+          val defaultIsolation = metadata.getDefaultTransactionIsolation
+          finalIsolationLevel = defaultIsolation
+          if (metadata.supportsTransactionIsolationLevel(isolationLevel)) {
+            // Finally update to actually requested level if possible
+            finalIsolationLevel = isolationLevel
+          } else {
+            logWarning(
+              s"Requested isolation level $isolationLevel is not supported; " +
+                s"falling back to default isolation level $defaultIsolation")
+          }
+        } else {
+          logWarning(
+            s"Requested isolation level $isolationLevel, but transactions are unsupported")
+        }
+      } catch {
+        case NonFatal(e) =>
+          logWarning("Exception while detecting transaction support", e)
+      }
+    }
+    val supportsTransactions = finalIsolationLevel != Connection.TRANSACTION_NONE
+
+    try {
+      if (supportsTransactions) {
+        conn.setAutoCommit(false) // Everything in the same db transaction.
+        conn.setTransactionIsolation(finalIsolationLevel)
+      }
+      val preparedStmt = conn.prepareStatement(statement)
+
+      try {
+        preparedStmt.execute()
+      } finally {
+        preparedStmt.close()
+      }
+      if (supportsTransactions) {
+        conn.commit()
+      }
+      committed = true
+      Iterator.empty
+    } catch {
+      case e: SQLException =>
+        val cause = e.getNextException
+        if (cause != null && e.getCause != cause) {
+          if (e.getCause == null) {
+            e.initCause(cause)
+          } else {
+            e.addSuppressed(cause)
+          }
+        }
+        throw e
+    } finally {
+      if (!committed) {
+        // The stage must fail.  We got here through an exception path, so
+        // let the exception through unless rollback() or close() want to
+        // tell the user about another problem.
+        if (supportsTransactions) {
+          conn.rollback()
+        }
+        conn.close()
+      } else {
+        // The stage must succeed.  We cannot propagate any exception close() might throw.
+        try {
+          conn.close()
+        } catch {
+          case e: Exception =>
+            logWarning("Transaction succeeded, but closing failed", e)
+        }
+      }
+    }
+  }
+
   /**
     * Compute the schema string for this RDD.
     */
@@ -1103,15 +1209,6 @@ object JdbcUtils extends Logging {
                       batchSize,
                       dialect,
                       isolationLevel))
-  }
-
-  /**
-    * Creates a table with a given schema.
-    */
-  def createTable(conn: Connection,
-                  df: DataFrame,
-                  options: JDBCOptions): Unit = {
-    createTable(conn, df.schema, df.sparkSession, options)
   }
 
   /**

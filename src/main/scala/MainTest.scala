@@ -5,7 +5,7 @@ object MainTest extends App {
   val spark = SparkSession.builder
     .appName("Spark Structured Streaming JDBC Sink Test App")
     .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
-    .master("local[*]")
+    .master("local[8]")
     .getOrCreate()
 
   import spark.implicits._
@@ -22,7 +22,7 @@ object MainTest extends App {
     .writeStream
     .format("org.apache.spark.sql.jdbcsink")
     .option("checkpointLocation", "checkpointLocation")
-    .option("url", "jdbc:teradata://192.168.43.154/DATABASE=MM") //TYPE=FASTLOAD
+    .option("url", "jdbc:teradata://192.168.1.102/DATABASE=MM,TYPE=FASTLOAD")
     .option("dbtable", "mm.Test1")
     .option("user", "DBC")
     .option("password", "dbc")
