@@ -1,2 +1,5 @@
 *.class
 *.log
+/spark-structured-streaming-jdbc-sink.iml
+.idea
+target
