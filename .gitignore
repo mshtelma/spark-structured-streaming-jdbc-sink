@@ -1,7 +1,7 @@
 *.class
 *.log
-.idea/*
 .idea
 .DS_Store
 checkpointLocation
 target
+*.iml
