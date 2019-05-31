@@ -80,7 +80,7 @@ class JDBCSinkLog(parameters: Map[String, String], sparkSession: SparkSession) {
   }
 
   def quote(colName: String): String = {
-    s""""$colName""""
+    s"""`$colName`"""
   }
 
   private def status(conn: Connection, batchId: Long): Option[String] = {
